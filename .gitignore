@@ -1,0 +1,30 @@
+# .NET build output
+bin/
+obj/
+
+# Publish / release working directories
+publish-*/
+release-*/
+
+# Release archives - uploaded separately to GitHub Releases
+*.zip
+*.tar.gz
+*.sha256
+
+# Local backups and development snapshots
+*.before-*
+*.working-*
+*.failed-*
+*.v0.1.0-working
+
+# Local third-party build/source tree
+third_party/
+
+# IDE / OS files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
