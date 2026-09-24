@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -162,6 +163,47 @@ public static unsafe class VextaRandomX
 
     private static readonly Dictionary<string, Dictionary<string, SeedContext>> Realms = new();
 
+    private static SeedContext BuildSeedContext(
+        ReadOnlySpan<byte> key,
+        RandomXFlags flags,
+        int vmCount)
+    {
+        var context = new GenContext
+        {
+            VmCount = vmCount
+        };
+
+        var vms = new BlockingCollection<RxVm>();
+
+        try
+        {
+            context.Init(key, flags);
+
+            Parallel.For(0, vmCount, _ =>
+            {
+                var vm = new RxVm();
+                vm.Init(flags, context.Cache, context.Dataset);
+                vms.Add(vm);
+            });
+
+            return new SeedContext
+            {
+                Context = context,
+                Vms = vms
+            };
+        }
+        catch
+        {
+            while(vms.TryTake(out var vm))
+                vm.Dispose();
+
+            vms.Dispose();
+            context.Dispose();
+
+            throw;
+        }
+    }
+
     public static void CreateSeed(
         string realm,
         string seedHex,
@@ -181,29 +223,41 @@ public static unsafe class VextaRandomX
             if(vmCount == -1)
                 vmCount = Environment.ProcessorCount;
 
-            var flags = GetFlags() | RandomXFlags.FullMem;
+            var key = Convert.FromHexString(seedHex);
 
-            var context = new GenContext
+            var baseFlags =
+                (GetFlags() | RandomXFlags.FullMem) &
+                ~RandomXFlags.LargePages;
+
+            SeedContext seed;
+
+            try
             {
-                VmCount = vmCount
-            };
+                var hugePageFlags =
+                    baseFlags | RandomXFlags.LargePages;
 
-            context.Init(Convert.FromHexString(seedHex), flags);
+                seed = BuildSeedContext(
+                    key,
+                    hugePageFlags,
+                    vmCount);
 
-            var vms = new BlockingCollection<RxVm>();
-
-            Parallel.For(0, vmCount, _ =>
+                Console.WriteLine("Huge Pages: ENABLED");
+            }
+            catch(Exception ex)
             {
-                var vm = new RxVm();
-                vm.Init(flags, context.Cache, context.Dataset);
-                vms.Add(vm);
-            });
+                Console.WriteLine(
+                    $"Huge Pages: unavailable ({ex.Message})");
 
-            seeds[seedHex] = new SeedContext
-            {
-                Context = context,
-                Vms = vms
-            };
+                Console.WriteLine(
+                    "Huge Pages: falling back to normal memory pages.");
+
+                seed = BuildSeedContext(
+                    key,
+                    baseFlags,
+                    vmCount);
+            }
+
+            seeds[seedHex] = seed;
         }
     }
 
@@ -228,6 +282,76 @@ public static unsafe class VextaRandomX
 
         seed.Context.Dispose();
         seed.Vms.Dispose();
+    }
+
+    public sealed class VmLease : IDisposable
+    {
+        private readonly SeedContext seed;
+        private RxVm? vm;
+
+        private VmLease(
+            SeedContext seed,
+            RxVm vm)
+        {
+            this.seed = seed;
+            this.vm = vm;
+        }
+
+        public void CalculateHash(
+            ReadOnlySpan<byte> data,
+            Span<byte> result)
+        {
+            if(result.Length < 32)
+                throw new ArgumentException(
+                    "RandomX result buffer must be at least 32 bytes.",
+                    nameof(result));
+
+            var current = vm
+                ?? throw new ObjectDisposedException(nameof(VmLease));
+
+            current.CalculateHash(data, result);
+        }
+
+        public void Dispose()
+        {
+            var current =
+                Interlocked.Exchange(ref vm, null);
+
+            if(current is not null)
+                seed.Vms.Add(current);
+        }
+
+        internal static VmLease? Acquire(
+            string realm,
+            string seedHex,
+            CancellationToken cancellationToken)
+        {
+            SeedContext? seed = null;
+
+            lock(Realms)
+            {
+                if(Realms.TryGetValue(realm, out var seeds))
+                    seeds.TryGetValue(seedHex, out seed);
+            }
+
+            if(seed is null)
+                return null;
+
+            var vm = seed.Vms.Take(cancellationToken);
+
+            return new VmLease(seed, vm);
+        }
+    }
+
+    public static VmLease? AcquireVm(
+        string realm,
+        string seedHex,
+        CancellationToken cancellationToken)
+    {
+        return VmLease.Acquire(
+            realm,
+            seedHex,
+            cancellationToken);
     }
 
     public static void CalculateHash(

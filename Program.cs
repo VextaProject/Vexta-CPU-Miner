@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
@@ -44,9 +45,11 @@ internal static class Program
     private static string? currentSeed;
 
     private static long nextSubmitId = 100;
+    private static long nextExtraNonce2;
     private static long totalHashes;
     private static long acceptedShares;
     private static long rejectedShares;
+    private static long foundBlocks;
 
     private static async Task Main(string[] args)
     {
@@ -178,7 +181,8 @@ internal static class Program
         Console.WriteLine();
         Console.WriteLine(
             $"Stopped. Accepted: {Interlocked.Read(ref acceptedShares)}, " +
-            $"Rejected: {Interlocked.Read(ref rejectedShares)}");
+            $"Rejected: {Interlocked.Read(ref rejectedShares)}, " +
+            $"Blocks: {Interlocked.Read(ref foundBlocks)}");
     }
 
     private static async Task RunSessionAsync(
@@ -293,8 +297,11 @@ internal static class Program
                     var height = parameters[0].GetInt64();
                     var hash = parameters[1].GetString() ?? "";
 
+                    var blockCount =
+                        Interlocked.Increment(ref foundBlocks);
+
                     WriteColor(
-                        $"*** BLOCK FOUND! Height {height} ***",
+                        $"*** BLOCK FOUND! #{blockCount} Height {height} ***",
                         ConsoleColor.Magenta);
 
                     WriteColor(
@@ -352,8 +359,11 @@ internal static class Program
                     var height = parameters[0].GetInt64();
                     var hash = parameters[1].GetString() ?? "";
 
+                    var blockCount =
+                        Interlocked.Increment(ref foundBlocks);
+
                     WriteColor(
-                        $"*** BLOCK FOUND! Height {height} ***",
+                        $"*** BLOCK FOUND! #{blockCount} Height {height} ***",
                         ConsoleColor.Magenta);
 
                     WriteColor(
@@ -558,6 +568,26 @@ internal static class Program
         cts?.Dispose();
     }
 
+    private static string NextExtraNonce2()
+    {
+        if(extraNonce2Size <= 0)
+            return string.Empty;
+
+        var value = unchecked(
+            (ulong)(Interlocked.Increment(ref nextExtraNonce2) - 1));
+
+        var width = extraNonce2Size * 2;
+
+        var hex = value.ToString(
+            "x",
+            CultureInfo.InvariantCulture);
+
+        if(hex.Length > width)
+            hex = hex[^width..];
+
+        return hex.PadLeft(width, '0');
+    }
+
     private static MiningJob ParseJob(JsonElement job)
     {
         var jobId = job[0].GetString()
@@ -586,7 +616,7 @@ internal static class Program
         var seed = job[9].GetString()
             ?? throw new Exception("Invalid RandomX seed");
 
-        var extraNonce2 = new string('0', extraNonce2Size * 2);
+        var extraNonce2 = NextExtraNonce2();
 
         var coinbaseHex =
             coinbase1 +
@@ -652,31 +682,47 @@ internal static class Program
             tasks[workerIndex] = Task.Run(
                 async () =>
                 {
+#pragma warning disable 618
+                    var header = new BlockHeader
+#pragma warning restore 618
+                    {
+                        Version = unchecked((int)job.Version),
+                        HashPrevBlock = uint256.Parse(job.PrevDisplay),
+                        HashMerkleRoot = new uint256(job.MerkleRoot),
+                        BlockTime = DateTimeOffset.FromUnixTimeSeconds(job.NTime),
+                        Bits = new Target(
+                            Encoders.Hex.DecodeData(job.BitsHex)),
+                        Nonce = 0
+                    };
+
+                    // Bitcoin/Vexta block header is always 80 bytes.
+                    // Only the final 4 bytes (nonce) change inside the hot loop.
+                    var headerBytes = header.ToBytes();
+                    var rxHash = new byte[32];
+
+                    using var vmLease =
+                        VextaRandomX.AcquireVm(
+                            Realm,
+                            job.Seed,
+                            ct)
+                        ?? throw new InvalidOperationException(
+                            "Unable to acquire RandomX VM.");
+
+                    if(headerBytes.Length != 80)
+                        throw new InvalidOperationException(
+                            $"Unexpected block-header size: {headerBytes.Length}");
+
                     for(ulong n = (ulong)localIndex;
                         n <= uint.MaxValue && !ct.IsCancellationRequested;
                         n += (ulong)threadCount)
                     {
                         var nonce = (uint)n;
 
-#pragma warning disable 618
-                        var header = new BlockHeader
-#pragma warning restore 618
-                        {
-                            Version = unchecked((int)job.Version),
-                            HashPrevBlock = uint256.Parse(job.PrevDisplay),
-                            HashMerkleRoot = new uint256(job.MerkleRoot),
-                            BlockTime = DateTimeOffset.FromUnixTimeSeconds(job.NTime),
-                            Bits = new Target(
-                                Encoders.Hex.DecodeData(job.BitsHex)),
-                            Nonce = nonce
-                        };
+                        BinaryPrimitives.WriteUInt32LittleEndian(
+                            headerBytes.AsSpan(76, 4),
+                            nonce);
 
-                        var headerBytes = header.ToBytes();
-                        var rxHash = new byte[32];
-
-                        VextaRandomX.CalculateHash(
-                            Realm,
-                            job.Seed,
+                        vmLease.CalculateHash(
                             headerBytes,
                             rxHash);
 
@@ -817,7 +863,8 @@ internal static class Program
                 WriteColor(
                     $"HASHRATE {FormatHashrate(rate)}  " +
                     $"A:{Interlocked.Read(ref acceptedShares)} " +
-                    $"R:{Interlocked.Read(ref rejectedShares)}",
+                    $"R:{Interlocked.Read(ref rejectedShares)} " +
+                    $"Blocks:{Interlocked.Read(ref foundBlocks)}",
                     ConsoleColor.Cyan);
 
                 lastHashes = hashes;
@@ -909,7 +956,7 @@ internal static class Program
 
         Console.ForegroundColor = ConsoleColor.White;
         Console.WriteLine();
-        Console.WriteLine("Vexta CPU Miner 0.1.0");
+        Console.WriteLine("Vexta CPU Miner 0.1.1");
 
         Console.ForegroundColor = ConsoleColor.DarkGray;
         Console.WriteLine("Copyright (c) 2026 Vexta Project");
